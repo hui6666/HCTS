@@ -14,12 +14,20 @@ def main():
     pred={'a':[inst(i,'甲'*23+'乙乙') for i in range(4)]}
     r=evaluate(gt,pred)
     close(r['detection']['recall'],.8)
+    close(r['one_ned_details']['dataset_level']['score'],.92)
     close(r['one_ned_details']['matched_only']['score'],.92)
     close(r['one_ned_details']['gt_penalized']['score'],.736)
     close(r['one_ned_details']['full_penalty']['score'],.736)
     r=evaluate({'a':[inst(0)]},{'a':[inst(0),inst(1)]})
     close(r['one_ned_details']['gt_penalized']['score'],1)
     close(r['one_ned_details']['full_penalty']['score'],.5)
+    g_len={'a':[inst(0,'甲'),inst(1,'甲'*20)]}
+    p_len={'a':[inst(0,'乙'),inst(1,'甲'*19+'乙')]}
+    r=evaluate(g_len,p_len)
+    close(r['one_ned_details']['matched_only']['score'],.475)
+    close(r['one_ned_details']['dataset_level']['score'],1-2/21)
+    assert r['primary_one_ned']['name']=='dataset_level'
+    close(r['primary_one_ned']['score'],1-2/21)
     g={'a':[inst(0),Instance(region=[0,0,9,10],text='',ignore=True)]}
     p={'a':[Instance(region=[0,0,9,10],text='甲')]}
     for strategy in ('greedy','cardinality_iou'):

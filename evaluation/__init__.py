@@ -14,7 +14,7 @@ from .evaluate import (
     parse_line, load_split_ids, restrict_to_split, selftest,
 )
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 __all__ = [
     "Instance", "MatchResult", "Counts",

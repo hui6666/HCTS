@@ -160,6 +160,7 @@ def recognition_metrics(gt: Sequence[Instance], pred: Sequence[Instance],
 
     matched_sims: List[float] = []
     edit_total = 0.0
+    matched_norm_len = 0.0
     matched_gt_len = 0.0
     all_gt_len = 0.0
     for g in gt:
@@ -172,6 +173,7 @@ def recognition_metrics(gt: Sequence[Instance], pred: Sequence[Instance],
         p_t = normalize_text(pred[pi].text, norm)
         matched_sims.append(one_ned(g_t, p_t))
         edit_total += levenshtein(g_t, p_t)
+        matched_norm_len += max(len(g_t), len(p_t))
         matched_gt_len += len(g_t)
 
     sim_sum = sum(matched_sims)
@@ -182,6 +184,8 @@ def recognition_metrics(gt: Sequence[Instance], pred: Sequence[Instance],
         aed_num += len(normalize_text(pred[j].text, norm))
 
     out = {
+        "dataset_level": (1.0 - edit_total / matched_norm_len
+                          if matched_norm_len > 0 else 0.0),
         "matched_only": sim_sum / n_match if n_match else 0.0,
         "gt_penalized": sim_sum / n_gt if n_gt else (1.0 if n_pred == 0 else 0.0),
         "pred_penalized": sim_sum / n_pred if n_pred else (1.0 if n_gt == 0 else 0.0),
@@ -190,7 +194,8 @@ def recognition_metrics(gt: Sequence[Instance], pred: Sequence[Instance],
         "n_matched": n_match,
         "aed_avg_gt_len": all_gt_len / n_gt if n_gt else 0.0,
     }
-    for k in ("matched_only", "gt_penalized", "pred_penalized", "symmetric"):
+    for k in ("dataset_level", "matched_only", "gt_penalized",
+              "pred_penalized", "symmetric"):
         out[k + "_percent"] = out[k] * 100.0
     return out
 

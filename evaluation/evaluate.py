@@ -23,7 +23,7 @@ except ImportError:
     from recognition import (NormalizeConfig, one_ned, levenshtein,
                              recognition_metrics, accuracy_metrics, e2e_metrics)
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 __all__ = [
     "Instance", "EvalConfig", "NormalizeConfig",
@@ -44,7 +44,7 @@ class EvalConfig:
     text_ned_threshold: float = 0.5
     region_format: str = "auto"
     require_gt_text: bool = False
-    primary_one_ned: str = "matched_only"
+    primary_one_ned: str = "dataset_level"
     normalize: NormalizeConfig = field(default_factory=NormalizeConfig)
 
     @classmethod
@@ -391,6 +391,7 @@ def evaluate(gt_map: Dict[str, List[Instance]],
     per_image: List[Dict[str, Any]] = []
     sim_sum = 0.0
     edit_sum = 0.0
+    matched_norm_len = 0.0
     all_gt_text_len = 0.0
     matched_gt_text_len = 0.0
     unmatched_pred_text_len = 0.0
@@ -418,6 +419,8 @@ def evaluate(gt_map: Dict[str, List[Instance]],
         add_counts(e2e_cnt, e_cnt)
 
         image_sim_sum = 0.0
+        image_edit_sum = 0.0
+        image_norm_len = 0.0
         image_text_matches = 0
         dropped_pred = {pi for gi, pi, _v in m.pairs if g[gi].ignore}
         for gi, row in enumerate(m.matrix):
@@ -435,9 +438,14 @@ def evaluate(gt_map: Dict[str, List[Instance]],
             gt_text = cfg.normalize.apply(g[gi].text)
             pred_text = cfg.normalize.apply(p[pi].text)
             similarity = one_ned(gt_text, pred_text)
+            edit_distance = levenshtein(gt_text, pred_text)
+            norm_len = max(len(gt_text), len(pred_text))
             sim_sum += similarity
             image_sim_sum += similarity
-            edit_sum += levenshtein(gt_text, pred_text)
+            edit_sum += edit_distance
+            image_edit_sum += edit_distance
+            matched_norm_len += norm_len
+            image_norm_len += norm_len
             matched_gt_text_len += len(gt_text)
             exact_count += int(gt_text == pred_text)
             n_text_matches += 1
@@ -463,6 +471,10 @@ def evaluate(gt_map: Dict[str, List[Instance]],
             "e2e_one_ned_denominator": image_denominator,
             "one_ned_matched_only": (image_sim_sum / image_text_matches
                                      if image_text_matches else 0.0),
+            "one_ned_dataset_level": (1.0 - image_edit_sum / image_norm_len
+                                      if image_norm_len > 0 else None),
+            "dataset_edit_sum": image_edit_sum,
+            "dataset_norm_len": image_norm_len,
         })
 
     det = {**prf(det_cnt.tp, det_cnt.fp, det_cnt.fn)}
@@ -473,6 +485,8 @@ def evaluate(gt_map: Dict[str, List[Instance]],
     canonical_denominator = n_text_matches + det_cnt.fn + det_cnt.fp
     canonical = sim_sum / canonical_denominator if canonical_denominator else 1.0
     effective_predictions = n_text_matches + det_cnt.fp
+    dataset_level = (1.0 - edit_sum / matched_norm_len
+                     if matched_norm_len > 0 else None)
     rec = {
         "e2e": canonical,
         "e2e_percent": canonical * 100.0,
@@ -481,6 +495,11 @@ def evaluate(gt_map: Dict[str, List[Instance]],
         "n_matched": n_text_matches,
         "n_fn": det_cnt.fn,
         "n_fp": det_cnt.fp,
+        "dataset_level": dataset_level,
+        "dataset_level_percent": (dataset_level * 100.0
+                                  if dataset_level is not None else None),
+        "dataset_edit_sum": edit_sum,
+        "dataset_norm_len": matched_norm_len,
         "matched_only": sim_sum / n_text_matches if n_text_matches else 0.0,
         "gt_penalized": sim_sum / det_cnt.n_gt if det_cnt.n_gt else 1.0,
         "pred_penalized": (sim_sum / effective_predictions
@@ -522,15 +541,23 @@ def evaluate(gt_map: Dict[str, List[Instance]],
                 for name, den in denominators.items()}
 
     details = aggregate_details(sim_sum, n_text_matches, det_cnt.fn, det_cnt.fp)
+    details["dataset_level"] = {
+        "numerator": edit_sum,
+        "denominator": matched_norm_len,
+        "score": dataset_level,
+        "percent": (100.0 * dataset_level if dataset_level is not None else None),
+        "definition": "1 - sum(ED) / sum(max(|gt|, |pred|))",
+    }
 
-    valid_primary = {"matched_only", "gt_penalized", "pred_penalized",
-                     "full_penalty", "symmetric"}
+    valid_primary = {"dataset_level", "matched_only", "gt_penalized",
+                     "pred_penalized", "full_penalty", "symmetric"}
     if cfg.primary_one_ned not in valid_primary:
         raise ValueError("unknown primary_one_ned %r; choose one of %s" %
                          (cfg.primary_one_ned, sorted(valid_primary)))
 
     m_count = n_text_matches
     upper_bounds = {
+        "dataset_level": 1.0 if matched_norm_len > 0 else None,
         "matched_only": 1.0 if m_count else None,
         "gt_penalized": (m_count / (m_count + det_cnt.fn)
                          if (m_count + det_cnt.fn) else None),
@@ -553,6 +580,14 @@ def evaluate(gt_map: Dict[str, List[Instance]],
     for row in per_image:
         row["one_ned_details"] = aggregate_details(
             row["e2e_one_ned_numerator"], row["matched"], row["fn"], row["fp"])
+        row_ds = row.get("one_ned_dataset_level")
+        row["one_ned_details"]["dataset_level"] = {
+            "numerator": row.get("dataset_edit_sum", 0.0),
+            "denominator": row.get("dataset_norm_len", 0.0),
+            "score": row_ds,
+            "percent": (100.0 * row_ds if row_ds is not None else None),
+            "definition": "1 - sum(ED) / sum(max(|gt|, |pred|))",
+        }
     macro_details = {}
     for name in details:
         values = [row["one_ned_details"][name]["score"] for row in per_image
@@ -651,8 +686,12 @@ def format_summary(report: Dict[str, Any]) -> str:
         ma = report["one_ned_macro_details"][name]
         score = "N/A" if value["percent"] is None else "%.2f" % value["percent"]
         mac = "N/A" if ma["percent"] is None else "%.2f" % ma["percent"]
-        L.append("  %s: micro=%s [%g/%d]; macro=%s (%d included, %d excluded images)" %
-                 (name, score, value["numerator"], value["denominator"], mac,
+        if name == "dataset_level":
+            detail = "1-ED=%g/%g" % (value["numerator"], value["denominator"])
+        else:
+            detail = "%g/%g" % (value["numerator"], value["denominator"])
+        L.append("  %s: micro=%s [%s]; macro=%s (%d included, %d excluded images)" %
+                 (name, score, detail, mac,
                   ma["included_images"], ma["excluded_images"]))
     L.append("Exact-match accuracy on matched regions: %.2f%%" % a.get("exact_match_percent", 0))
     L.append("=" * 68)
@@ -721,11 +760,21 @@ def selftest(verbose: bool = True) -> int:
     check("regression detection R", rep["detection"]["recall"], 2 / 3, 1e-9)
     check("regression detection F1", rep["detection"]["f1"], 2 / 3, 1e-9)
     check("regression matched_only", rep["one_ned"]["matched_only"], 0.9166666667, 1e-9)
+    check("regression dataset_level", rep["one_ned"]["dataset_level"], 0.9, 1e-9)
     check("regression gt_penalized", rep["one_ned"]["gt_penalized"], 0.6111111111, 1e-9)
     check("regression symmetric", rep["one_ned"]["symmetric"], 0.6111111111, 1e-9)
     check("regression TP", rep["counts"]["tp"], 2)
     check("regression FP", rep["counts"]["fp"], 1)
     check("regression FN", rep["counts"]["fn"], 1)
+
+    len_gt = {"L": [_mk_instance([0, 0, 10, 10], "甲"),
+                    _mk_instance([20, 0, 30, 10], "甲" * 20)]}
+    len_pred = {"L": [_mk_instance([0, 0, 10, 10], "乙"),
+                      _mk_instance([20, 0, 30, 10], "甲" * 19 + "乙")]}
+    len_rep = evaluate(len_gt, len_pred, EvalConfig(region_format="bbox"))
+    check("unequal-length matched_only", len_rep["one_ned"]["matched_only"], 0.475, 1e-9)
+    check("unequal-length dataset_level", len_rep["one_ned"]["dataset_level"],
+          1.0 - 2.0 / 21.0, 1e-9)
 
     cross_gt = {"A": [_mk_instance([0, 0, 10, 10], "甲")]}
     cross_pred = {"B": [_mk_instance([0, 0, 10, 10], "甲")]}
@@ -856,9 +905,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         "| ned=1-NED>=threshold | substring=containment")
     e.add_argument("--text-ned-threshold", type=float)
     e.add_argument("--primary-one-ned",
-                   choices=["matched_only", "gt_penalized", "pred_penalized",
-                            "full_penalty", "symmetric"],
-                   help="publication-facing 1-NED field; default matched_only. "
+                   choices=["dataset_level", "matched_only", "gt_penalized",
+                            "pred_penalized", "full_penalty", "symmetric"],
+                   help="publication-facing 1-NED field; default dataset_level. "
                         "All definitions are always reported.")
     e.add_argument("--strip-spaces", action="store_true")
     e.add_argument("--casefold", action="store_true")
@@ -934,7 +983,8 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         "prediction": str(Path(args.pred).resolve()),
         "prediction_sha256": path_sha256(args.pred),
         "evaluator_version": __version__,
-        "aggregation": "micro over instances after per-image matching",
+        "aggregation": ("dataset-level 1-NED = 1 - sum(edit_distance) / "
+                        "sum(max(|gt|,|pred|)) over spatially matched text pairs"),
         "primary_one_ned": cfg.primary_one_ned,
         "one_ned_outputs": "primary_one_ned plus all definitions in one_ned_details and one_ned_macro_details",
     }
@@ -979,7 +1029,8 @@ End-to-end      e2e_metrics(..., text_criterion)
 Recognition     one_ned(gt, pred)          recognition.py
                 instance-level 1-NED = 1 - ED / max(|gt|, |pred|)
                 recognition_metrics(...)   dataset-level aggregates:
-                matched_only / gt_penalized / pred_penalized / full_penalty / symmetric / aed
+                dataset_level = 1 - sum(ED) / sum(max(|gt|, |pred|))
+                plus matched_only / gt_penalized / pred_penalized / full_penalty / symmetric / aed
                 accuracy_metrics(...)      exact-match rate / char-level accuracy
 
 One-stop        evaluate(gt_map, pred_map, EvalConfig)      evaluate.py
